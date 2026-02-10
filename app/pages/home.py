@@ -4,10 +4,9 @@ from pathlib import Path
 from nba_api.stats.endpoints import ScheduleLeagueV2
 from nba_api.stats.endpoints import playergamelogs
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-# parent.parent because: app/pages/home.py → app/
-
+BASE_DIR = Path(__file__).resolve().parent
 DATA_CACHE = BASE_DIR / "data_cache"
+
 
 
 ## make request and returrns dataframe
