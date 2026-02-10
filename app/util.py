@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 import numpy as np
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent
 # parent.parent because: app/pages/home.py → app/
 
 DATA_CACHE = BASE_DIR / "data_cache"
