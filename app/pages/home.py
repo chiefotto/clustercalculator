@@ -1,7 +1,13 @@
 import streamlit as st
 import pandas as pd
+from pathlib import Path
 from nba_api.stats.endpoints import ScheduleLeagueV2
 from nba_api.stats.endpoints import playergamelogs
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+# parent.parent because: app/pages/home.py → app/
+
+DATA_CACHE = BASE_DIR / "data_cache"
 
 
 ## make request and returrns dataframe
@@ -33,7 +39,7 @@ def filter_for_todays_games(formatted_sched:pd.DataFrame)->pd.DataFrame:
 
 
 def add_clusters_to_table(schedule: pd.DataFrame) -> pd.DataFrame:
-    clusters_df = pd.read_parquet("/data_cache/clusters_and_teams_jan21.parquet")[
+    clusters_df = pd.read_parquet(DATA_CACHE / "clusters_and_teams_jan21.parquet")[
         ["TEAM_ID", "cluster", "full_name", "abbreviation"]
     ].copy()
 
