@@ -1,8 +1,14 @@
 ### this is a utility file 
 ### should read in csv of 
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 import numpy as np
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+# parent.parent because: app/pages/home.py → app/
+
+DATA_CACHE = BASE_DIR / "data_cache"
 
 
 def read_pqt(path):
@@ -13,7 +19,7 @@ def read_pqt(path):
 @st.cache_data
 def read_cluster_file():
     # cluster_file = pd.read_parquet('../data/jan21clusters.parquet')
-    path = 'data_cache/jan21clusters.parquet'
+    path = (DATA_CACHE/'jan21clusters.parquet')
     cluster_file= read_pqt(path)
 
     cluster_df = cluster_file[['TEAM_ID', 'cluster']]
