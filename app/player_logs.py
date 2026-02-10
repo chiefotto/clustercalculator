@@ -8,9 +8,12 @@ import pandas as pd
 import streamlit as st
 from nba_api.stats.endpoints import playergamelogs
 from util import read_pqt
+BASE_DIR = Path(__file__).resolve().parent
+# parent.parent because: app/pages/home.py → app/
 
+DATA_CACHE = BASE_DIR / "data_cache"
 
-teams_df = read_pqt("data_cache/nba_teams.parquet")
+teams_df = read_pqt(DATA_CACHE/"nba_teams.parquet")
 
 abbrev_to_id = dict(zip(teams_df["abbreviation"], teams_df["id"]))
 abbrev_to_full_name = dict(zip(teams_df["abbreviation"], teams_df["full_name"]))

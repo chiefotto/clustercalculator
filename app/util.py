@@ -31,7 +31,7 @@ def read_cluster_file():
 @st.cache_data
 def merged_team_clusters():
     cluster_df, _ = read_cluster_file()
-    nba_teams = read_pqt("data_cache/nba_teams.parquet")
+    nba_teams = read_pqt(DATA_CACHE/"nba_teams.parquet")
 
     merged = cluster_df.merge(
         nba_teams[["id", "full_name", "abbreviation"]],
