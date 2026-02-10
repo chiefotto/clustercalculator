@@ -33,7 +33,7 @@ def filter_for_todays_games(formatted_sched:pd.DataFrame)->pd.DataFrame:
 
 
 def add_clusters_to_table(schedule: pd.DataFrame) -> pd.DataFrame:
-    clusters_df = pd.read_parquet("../data/clusters_and_teams_jan21.parquet")[
+    clusters_df = pd.read_parquet("/data_cache/clusters_and_teams_jan21.parquet")[
         ["TEAM_ID", "cluster", "full_name", "abbreviation"]
     ].copy()
 
