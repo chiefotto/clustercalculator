@@ -29,9 +29,18 @@ def format_raw_sched (raw_sched:pd.DataFrame)->pd.DataFrame:
 
 # formatted_sched = format_raw_sched(intial_sched_pull)
 
-def filter_for_todays_games(formatted_sched:pd.DataFrame)->pd.DataFrame:
-    todays_date = pd.Timestamp.today().date()
-    todays_schedule = formatted_sched.loc[formatted_sched["gameDateEst"] == todays_date].copy(deep=True)
+def filter_for_todays_games(formatted_sched: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filter the full league schedule down to games for "today" in Eastern time.
+
+    The NBA schedule returned by ScheduleLeagueV2 uses gameDateEst (Eastern),
+    while Streamlit Cloud typically runs in UTC. If we used the server's local
+    date, late games could cause the app to jump to the next day's schedule
+    as soon as it hits midnight UTC. By explicitly using US/Eastern here,
+    we keep "today" aligned with the official gameDateEst.
+    """
+    eastern_today = pd.Timestamp.now(tz="US/Eastern").date()
+    todays_schedule = formatted_sched.loc[formatted_sched["gameDateEst"] == eastern_today].copy(deep=True)
     return todays_schedule
 
 # todays_games = filter_for_todays_games(formatted_sched)
