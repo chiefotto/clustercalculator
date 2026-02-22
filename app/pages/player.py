@@ -1,7 +1,6 @@
 import streamlit as st
 from util import read_cluster_file, merged_team_clusters,basic_stats,prob_to_american,prob_over_line
 from data_util import filter_player_vs_cluster, filter_player_logs,general_player_logs
-import pygwalker as pyg
 
 def player_details_page():
         

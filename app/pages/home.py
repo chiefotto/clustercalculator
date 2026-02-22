@@ -3,7 +3,6 @@ import pandas as pd
 from pathlib import Path
 from nba_api.stats.endpoints import ScheduleLeagueV2
 from nba_api.stats.endpoints import playergamelogs
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 # parent.parent because: app/pages/home.py → app/
 
