@@ -7,8 +7,9 @@ import streamlit as st
 
 home = st.Page("pages/home.py", title="Home", default=True)
 details = st.Page("pages/game_details.py", title="Game Details")
-player = st.Page("pages/player.py", title="Player View")
+player_view = st.Page("pages/player_view.py", title="Player View")
 settings = st.Page("pages/settings.py", title="Settings")
 game_logs = st.Page("pages/game_logs.py", title="Game Logs")
-pg = st.navigation([home, details,player,settings, game_logs])
+dvp = st.Page("pages/dvp.py", title="DVP")
+pg = st.navigation([home, details,player_view,settings, game_logs, dvp])
 pg.run()

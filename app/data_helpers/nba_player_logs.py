@@ -1,6 +1,8 @@
 import streamlit as st
-from util import read_cluster_file, merged_team_clusters,basic_stats,prob_to_american,prob_over_line
-from data_util import filter_player_vs_cluster, filter_player_logs,general_player_logs
+import pandas as pd
+from util import read_cluster_file, merged_team_clusters, basic_stats, prob_to_american, prob_over_line
+from data_util import filter_player_vs_cluster, filter_player_logs, general_player_logs
+from data_helpers.nba_dvp import get_dvp_with_def_factors, get_opponent_dvp_for_player
 
 def player_details_page():
         
@@ -15,6 +17,7 @@ def player_details_page():
     away_team_id = st.session_state.away_team_id
     player_id = st.session_state.player_id
     player_name = st.session_state.player_name
+    player_position = st.session_state.get("player_position", "")
     opp_team_id = away_team_id if player_team_id == home_team_id else home_team_id
     keep_player_columns = ['PLAYER_NAME','MIN','PTS','REB', 'AST','TOV', 'STL', 'BLK', 'PF','FGM', 'FGA', 'FG3M', 'FG3A', 'FTM', 'FTA', 'OREB', 'DREB', 'PLUS_MINUS','WL','BLKA', 'PFD','TEAM_NAME','GAME_DATE', 'OPP_TEAM_NAME']
 
@@ -51,31 +54,86 @@ def player_details_page():
     
     player_df = player_df_1[keep_player_columns]
 
-    
+    # --- Opponent DVP by player position (ranked, with projected stats) ---
+    dvp_table = get_dvp_with_def_factors()
+    opp_dvp_df = get_opponent_dvp_for_player(dvp_table, opp_team_id, player_position)
+    if not opp_dvp_df.empty and not player_df.empty:
+        def _player_avg(stat_label: str) -> float:
+            if stat_label == "PTS":
+                return float(player_df["PTS"].mean())
+            if stat_label == "REB":
+                return float(player_df["REB"].mean())
+            if stat_label == "AST":
+                return float(player_df["AST"].mean())
+            if stat_label == "STL":
+                return float(player_df["STL"].mean())
+            if stat_label == "BLK":
+                return float(player_df["BLK"].mean())
+            if stat_label == "TOV":
+                return float(player_df["TOV"].mean())
+            if stat_label == "3PM":
+                return float(player_df["FG3M"].mean())
+            if stat_label == "FG%":
+                t = player_df["FGA"].sum()
+                return (player_df["FGM"].sum() / t) if t and t > 0 else 0.0
+            if stat_label == "FT%":
+                t = player_df["FTA"].sum()
+                return (player_df["FTM"].sum() / t) if t and t > 0 else 0.0
+            return 0.0
 
+        opp_dvp_df = opp_dvp_df.copy()
+        opp_dvp_df["avg"] = opp_dvp_df["stat"].map(_player_avg)
+        opp_dvp_df["projected"] = (opp_dvp_df["avg"] * opp_dvp_df["def_factor"]).round(2)
+        opp_dvp_df["avg"] = opp_dvp_df["avg"].round(2)
+        st.subheader("Opponent DVP (by your position)")
+        st.caption(f"Position: {player_position or '—'} → defense vs league. Rank 1 = best matchup. Projected = avg × def_factor.")
+        st.dataframe(opp_dvp_df[["stat", "def_factor", "rank", "avg", "projected"]], use_container_width=True, hide_index=True)
+        c1, c2, c3 = st.columns(3)
+        for col, row_label in zip([c1, c2, c3], ["PTS", "REB", "AST"]):
+            row = opp_dvp_df[opp_dvp_df["stat"] == row_label]
+            with col:
+                if not row.empty:
+                    r = row.iloc[0]
+                    st.metric(label=f"Projected {row_label}", value=r["projected"], delta=f"def factor {r['def_factor']:.2f}")
 
-
-   
-    
-    
     st.write("Player Name", player_name, 'game logs')
-
-
     st.dataframe(player_df)
 
 
     st.write("player vs cluster:", player_opp_cluster)
-    # pyg.walk(player_vs_cluster_df, env="streamlit")
 
     player_vs_cluster_df = player_vs_cluster_df_1[keep_player_columns]
     st.dataframe(player_vs_cluster_df)
+
+    cluster_game_ids = set(player_vs_cluster_df_1["GAME_ID"].astype(str))
+    season_excluding_cluster = player_df_1[~player_df_1["GAME_ID"].astype(str).isin(cluster_game_ids)]
+
+    def projection(cluster_data, season_data):
+        return 0.7  * cluster_data + 0.3 * season_data
+
+    pts_projection = projection(player_vs_cluster_df['PTS'].mean(), season_excluding_cluster['PTS'].mean())
+    reb_projection = projection(player_vs_cluster_df['REB'].mean(), season_excluding_cluster['REB'].mean())
+    ast_projection = projection(player_vs_cluster_df['AST'].mean(), season_excluding_cluster['AST'].mean())
+
+
+
+
+    m5,m6,m7 = st.columns(3)
+
+    with m5:
+        st.metric(label="PTS Projection", value=pts_projection)
+    with m6:
+        st.metric(label="REB Projection", value=reb_projection)
+        
+    with m7:
+        st.metric(label="AST Projection", value=ast_projection)
+    
 
 
     numeric_cols = player_vs_cluster_df.select_dtypes(include="number").columns.tolist()
     col = st.selectbox("Stat column", numeric_cols, index=numeric_cols.index("PTS") if "PTS" in numeric_cols else 0)
     line = st.number_input("Line (e.g. 5.5)", value=5.5, step=0.5)
-    cluster_game_ids = set(player_vs_cluster_df_1["GAME_ID"].astype(str))
-    season_excluding_cluster = player_df_1[~player_df_1["GAME_ID"].astype(str).isin(cluster_game_ids)]
+    
 
 
     y_ex = season_excluding_cluster[col]
@@ -126,6 +184,12 @@ def player_details_page():
     st.divider()
     st.subheader(f"Value Analysis: {col} @ {line}")
 
+ 
+
+
+
+
+    
     m1, m2, m3,m4 = st.columns(4)
 
     with m1:
@@ -153,6 +217,7 @@ def player_details_page():
 
     with m4: 
         st.metric(label="Hit rate delta ", value= f"{hit_rate_delta:.1}")
+ 
 
 
 
@@ -162,8 +227,7 @@ def player_details_page():
 
 
 
-
-player_details_page()
+# player_details_page()
 
 
 
