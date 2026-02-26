@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 from nba_api.stats.endpoints import playergamelogs
 from util import read_pqt
+from data_util import general_player_logs
 BASE_DIR = Path(__file__).resolve().parent
 # parent.parent because: app/pages/home.py → app/
 
@@ -100,8 +101,9 @@ def upsert_league_logs(dedupe_cols=("GAME_ID", "PLAYER_ID")) -> dict:
 
     merged.to_parquet(LEAGUE_LOGS_PATH, index=False)
 
-    # Clear cached load so UI reads updated file
+    # Clear cached loads so UI and other pages read updated file
     load_league_logs.clear()
+    general_player_logs.clear()
 
     return {"added": len(new_rows), "total": len(merged), "was_empty": False}
 
