@@ -1,52 +1,57 @@
-### this is a utility file 
-### should read in csv of 
 from pathlib import Path
 import pandas as pd
 import streamlit as st
 import numpy as np
 
 BASE_DIR = Path(__file__).resolve().parent
-# parent.parent because: app/pages/home.py → app/
 
 DATA_CACHE = BASE_DIR / "data_cache"
 
 
 def read_pqt(path):
-    file_path = pd.read_parquet(path)
-    return file_path
+    return pd.read_parquet(path)
+
+
+def _latest_canon_path() -> Path | None:
+    """Return the newest defense_clusters_*.parquet if one exists."""
+    candidates = sorted(DATA_CACHE.glob("defense_clusters_*.parquet"))
+    return candidates[-1] if candidates else None
 
 
 @st.cache_data
 def read_cluster_file():
-    # cluster_file = pd.read_parquet('../data/jan21clusters.parquet')
-    path = (DATA_CACHE/'jan21clusters.parquet')
-    cluster_file= read_pqt(path)
-
-    cluster_df = cluster_file[['TEAM_ID', 'cluster']]
+    """
+    Load cluster assignments. Prefers the canonical pipeline parquet;
+    falls back to the legacy jan21clusters.parquet.
+    """
+    canon = _latest_canon_path()
+    if canon and canon.exists():
+        df = pd.read_parquet(canon)
+        cluster_df = df[["TEAM_ID", "CLUSTER"]].rename(columns={"CLUSTER": "cluster"})
+    else:
+        path = DATA_CACHE / "jan21clusters.parquet"
+        cluster_df = pd.read_parquet(path)[["TEAM_ID", "cluster"]]
 
     cluster_map = cluster_df.groupby("cluster")["TEAM_ID"].apply(list).to_dict()
-
     return cluster_df, cluster_map
+
 
 @st.cache_data
 def merged_team_clusters():
     cluster_df, _ = read_cluster_file()
-    nba_teams = read_pqt(DATA_CACHE/"nba_teams.parquet")
+    nba_teams = read_pqt(DATA_CACHE / "nba_teams.parquet")
 
     merged = cluster_df.merge(
         nba_teams[["id", "full_name", "abbreviation"]],
         left_on="TEAM_ID",
         right_on="id",
-        how="left"
+        how="left",
     )
-
-    # optional: clean column names
     merged = merged.drop(columns=["id"])
     merged = merged.rename(columns={
         "full_name": "TEAM_NAME",
-        "abbreviation": "TEAM_ABBR"
+        "abbreviation": "TEAM_ABBR",
     })
-
     return merged
 
 
