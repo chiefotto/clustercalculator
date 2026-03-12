@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+from scipy.stats import norm
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_CACHE = BASE_DIR / "data_cache"
@@ -227,3 +228,182 @@ def last_updated(season: str) -> str | None:
         ts = datetime.fromtimestamp(path.stat().st_mtime)
         return ts.isoformat()
     return None
+
+
+# ── Display helpers (Units toggle) ────────────────────────────────────────
+
+def z_to_percentile(z: float | np.ndarray) -> float | np.ndarray:
+    """Convert z-score(s) to percentile(s) in [0, 100]."""
+    return np.clip(norm.cdf(z) * 100, 0, 100)
+
+
+def percentile_to_band(p: float) -> str:
+    if p < 10:
+        return "Very Low"
+    if p < 25:
+        return "Low"
+    if p < 75:
+        return "Typical"
+    if p < 90:
+        return "High"
+    return "Very High"
+
+
+_BAND_COLOR = {
+    "Very Low": "#2471A3",
+    "Low":      "#5DADE2",
+    "Typical":  "#85929E",
+    "High":     "#E67E22",
+    "Very High": "#C0392B",
+}
+
+
+def band_color(band: str) -> str:
+    return _BAND_COLOR.get(band, "#85929E")
+
+
+def format_feature_value(z: float, units_mode: str) -> str:
+    """Return a display string for *z* given the selected *units_mode*."""
+    p = float(z_to_percentile(z))
+    b = percentile_to_band(p)
+    if units_mode == "Z-score (σ)":
+        return f"{z:+.2f}σ"
+    if units_mode == "Percentile":
+        return f"{p:.0f}th pct"
+    return b
+
+
+def hover_line(feature: str, z: float) -> str:
+    """Rich hover line that always shows percentile + band + z."""
+    p = float(z_to_percentile(z))
+    b = percentile_to_band(p)
+    return f"{feature}: {p:.0f}th pct ({b}) · {z:+.2f}σ"
+
+
+# ── Feature label map (human-readable short phrases) ──────────────────────
+
+FEATURE_LABEL_MAP: dict[str, tuple[str, str]] = {
+    # (positive_phrase, negative_phrase)
+    "OPP_FG3A":                       ("High 3PA allowed",       "Low 3PA allowed"),
+    "OPP_FG3_PCT":                    ("Poor perimeter D",       "Tight perimeter D"),
+    "OPP_FTA":                        ("Foul-prone",             "Disciplined fouling"),
+    "OPP_OREB":                       ("Gives up OREBs",         "Limits OREBs"),
+    "OPP_AST":                        ("Allows ball movement",   "Disrupts passing"),
+    "OPP_TOV":                        ("Forces turnovers",       "Low turnover pressure"),
+    "STL":                            ("Active steals",          "Low steal rate"),
+    "BLK":                            ("Shot-blocking",          "Low block rate"),
+    "DREB_PCT":                       ("Strong rebounding",      "Weak rebounding"),
+    "OPP_FTA_RATE":                   ("Foul-prone",             "Disciplined fouling"),
+    "OPP_TOV_PCT":                    ("Turnover pressure",      "Low pressure"),
+    "OPP_OREB_PCT":                   ("Gives up OREBs",         "Limits OREBs"),
+    "OPP_PTS_OFF_TOV":                ("Pts off TOs allowed",    "Limits pts off TOs"),
+    "OPP_PTS_2ND_CHANCE":             ("2nd-chance vulnerable",  "Limits 2nd-chance"),
+    "OPP_PTS_FB":                     ("Transition vulnerable",  "Limits transition"),
+    "OPP_PTS_PAINT":                  ("Paint vulnerable",       "Paint stingy"),
+    "DEFLECTIONS_PER100":             ("Active hands",           "Passive hands"),
+    "CONTESTED_SHOTS_2PT_PER100":     ("Contests 2PT shots",     "Low 2PT contests"),
+    "CONTESTED_SHOTS_3PT_PER100":     ("Contests 3PT shots",     "Low 3PT contests"),
+    "CHARGES_DRAWN_PER100":           ("Draws charges",          "Few charges"),
+    "DEF_LOOSE_BALLS_RECOVERED_PER100": ("Recovers loose balls", "Loses loose balls"),
+    "DEF_BOXOUTS_PER100":             ("Strong boxouts",         "Weak boxouts"),
+    "OPP_SHOT_FG3A_FREQ":            ("High 3PA frequency",     "Low 3PA frequency"),
+}
+
+
+def _feature_phrase(feature: str, z: float) -> str:
+    """Return a short human-readable phrase for *feature* given deviation *z*."""
+    pair = FEATURE_LABEL_MAP.get(feature)
+    if pair:
+        return pair[0] if z > 0 else pair[1]
+    direction = "High" if z > 0 else "Low"
+    short = feature.replace("_PER100", "").replace("OPP_", "").replace("_", " ").title()
+    return f"{direction} {short}"
+
+
+@st.cache_data
+def compute_cluster_labels(
+    df: pd.DataFrame,
+    _league_means: pd.Series,
+    _league_stds: pd.Series,
+) -> dict[int, str]:
+    """
+    Generate a human-readable label for each cluster based on its
+    strongest deviations from the league mean.
+    """
+    feature_cols = get_feature_columns(df)
+    labels: dict[int, str] = {}
+    for cid in sorted(df["CLUSTER"].unique()):
+        mask = df["CLUSTER"] == cid
+        cluster_mean = df.loc[mask, feature_cols].mean()
+        z = ((cluster_mean - _league_means) / _league_stds).dropna()
+
+        pos = z[z > 0.5].sort_values(ascending=False)
+        neg = z[z < -0.5].sort_values()
+
+        parts: list[str] = []
+        for feat in pos.head(2).index:
+            parts.append(_feature_phrase(feat, pos[feat]))
+        if not neg.empty:
+            parts.append(_feature_phrase(neg.index[0], neg.iloc[0]))
+
+        label = " + ".join(parts[:2])
+        if len(parts) > 2:
+            label += f" / {parts[2]}"
+        if not label:
+            label = "League average"
+        labels[cid] = label[:50]
+
+    return labels
+
+
+def cluster_display_name(cid: int, labels: dict[int, str]) -> str:
+    return f"{cid} — {labels.get(cid, '')}"
+
+
+# ── PCA axis interpretation ──────────────────────────────────────────────
+
+_THEME_KEYWORDS: dict[str, list[str]] = {
+    "Pressure":   ["OPP_TOV_PCT", "DEFLECTIONS_PER100", "OPP_TOV", "STL"],
+    "Perimeter":  ["OPP_FG3A", "CONTESTED_SHOTS_3PT_PER100", "OPP_FG3_PCT",
+                   "OPP_SHOT_FG3A_FREQ"],
+    "Paint":      ["OPP_PTS_PAINT", "BLK", "CONTESTED_SHOTS_2PT_PER100"],
+    "Fouling":    ["OPP_FTA_RATE", "OPP_FTA"],
+    "Transition": ["OPP_PTS_FB"],
+    "Rebounding": ["OPP_OREB_PCT", "DREB_PCT", "DEF_BOXOUTS_PER100", "OPP_OREB"],
+    "Hustle":     ["DEFLECTIONS_PER100", "CHARGES_DRAWN_PER100",
+                   "DEF_LOOSE_BALLS_RECOVERED_PER100"],
+}
+
+
+def interpret_pc_axis(
+    loadings: list[float],
+    feature_names: list[str],
+    top_n: int = 5,
+) -> tuple[str, list[tuple[str, float]], list[tuple[str, float]]]:
+    """
+    Interpret a single PCA component.
+
+    Returns (subtitle, top_positive, top_negative) where each list is
+    [(feature_name, loading), ...].
+    """
+    pairs = sorted(zip(feature_names, loadings), key=lambda x: x[1])
+    top_neg = [(f, round(v, 3)) for f, v in pairs[:top_n]]
+    top_pos = [(f, round(v, 3)) for f, v in pairs[-top_n:]][::-1]
+
+    def _theme(items: list[tuple[str, float]]) -> str:
+        feats = {f for f, _ in items[:3]}
+        best_theme, best_count = "", 0
+        for theme, keywords in _THEME_KEYWORDS.items():
+            count = len(feats & set(keywords))
+            if count > best_count:
+                best_theme, best_count = theme, count
+        if best_count >= 1:
+            return best_theme
+        short = items[0][0].replace("_PER100", "").replace("OPP_", "")
+        return short.replace("_", " ").title()
+
+    pos_theme = _theme(top_pos)
+    neg_theme = _theme(top_neg)
+    subtitle = f"{pos_theme} ↔ {neg_theme}"
+
+    return subtitle, top_pos, top_neg

@@ -40,6 +40,7 @@ import json
 import time
 import warnings
 from datetime import datetime, timezone
+from json import JSONDecodeError
 from pathlib import Path
 
 import numpy as np
@@ -132,12 +133,22 @@ def _pause():
 
 
 def _retry(fn):
-    """Call *fn()* with retries on timeout / connection errors."""
+    """Call *fn()* with retries on timeout / connection errors.
+
+    JSONDecodeError is treated as non-retryable: it means the NBA API
+    returned an empty / non-JSON body (typically because no data exists
+    for the requested season).
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             result = fn()
             _pause()
             return result
+        except JSONDecodeError:
+            raise ValueError(
+                "The NBA API returned an empty response -- this usually "
+                "means data for the requested season is not available yet."
+            )
         except Exception as exc:
             print(f"    [retry {attempt}/{MAX_RETRIES}] {type(exc).__name__}")
             if attempt == MAX_RETRIES:
@@ -552,6 +563,8 @@ def run_pipeline(
         "pca_variance_target": pca_variance_target,
         "pca_components_kept": int(n_keep),
         "pca_explained_variance": pca_obj.explained_variance_ratio_.tolist(),
+        "pca_components": pca_obj.components_.tolist(),
+        "pca_feature_names": features_after,
         "pc1_quality_corr": round(pc1_corr, 4),
         "dropped_pc1": should_drop,
         "drop_pc1_threshold": drop_pc1_threshold,
