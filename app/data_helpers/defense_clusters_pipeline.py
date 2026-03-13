@@ -37,13 +37,16 @@ Usage
 """
 
 import json
+import os
 import time
 import warnings
 from datetime import datetime, timezone
+from json import JSONDecodeError
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
@@ -54,16 +57,24 @@ from nba_api.stats.endpoints import (
     leaguehustlestatsteam,
     leaguedashoppptshot,
 )
+from nba_api.stats.library.http import NBAStatsHTTP, STATS_HEADERS
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 PIPELINE_VERSION = "2.0.0"
 
+
+class UnsupportedFilterError(Exception):
+    """Raised when the requested window/filter is not supported by the NBA API endpoints."""
+    pass
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_CACHE = BASE_DIR / "data_cache"
-API_DELAY = 1.0
-API_TIMEOUT = 60
-MAX_RETRIES = 3
+API_DELAY = float(os.getenv("DEFENSE_CLUSTERS_API_DELAY", "1.0"))
+API_TIMEOUT = float(os.getenv("DEFENSE_CLUSTERS_API_TIMEOUT", "45"))
+MAX_RETRIES = int(os.getenv("DEFENSE_CLUSTERS_MAX_RETRIES", "4"))
+RETRY_BACKOFF_SEC = float(os.getenv("DEFENSE_CLUSTERS_RETRY_BACKOFF_SEC", "5"))
+NBA_HEADERS = {**STATS_HEADERS, "Connection": "close"}
 
 
 # ── Feature maps ─────────────────────────────────────────────────────────
@@ -131,48 +142,88 @@ def _pause():
     time.sleep(API_DELAY)
 
 
-def _retry(fn):
-    """Call *fn()* with retries on timeout / connection errors."""
+def _build_nba_session() -> requests.Session:
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _reset_nba_http_session() -> None:
+    NBAStatsHTTP.set_session(_build_nba_session())
+
+
+_reset_nba_http_session()
+
+
+def _retry(fn, label: str):
+    """Call *fn()* with retries on timeout / connection errors.
+
+    JSONDecodeError is treated as non-retryable: it means the NBA API
+    returned an empty / non-JSON body (typically because no data exists
+    for the requested season).
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             result = fn()
             _pause()
             return result
+        except JSONDecodeError:
+            raise ValueError(
+                "The NBA API returned an empty response -- this usually "
+                "means data for the requested season is not available yet."
+            )
         except Exception as exc:
-            print(f"    [retry {attempt}/{MAX_RETRIES}] {type(exc).__name__}")
+            _reset_nba_http_session()
+            print(f"    {label} [retry {attempt}/{MAX_RETRIES}] {type(exc).__name__}: {exc}")
             if attempt == MAX_RETRIES:
                 raise
-            time.sleep(API_DELAY * attempt * 2)
+            backoff = RETRY_BACKOFF_SEC * attempt
+            print(f"    waiting {backoff}s before retry ...")
+            time.sleep(backoff)
     raise RuntimeError("unreachable")
 
 
 def fetch_team_stats(measure_type: str, season: str) -> pd.DataFrame:
-    return _retry(lambda: leaguedashteamstats.LeagueDashTeamStats(
-        measure_type_detailed_defense=measure_type,
-        per_mode_detailed="Per100Possessions",
-        season=season,
-        season_type_all_star="Regular Season",
-        timeout=API_TIMEOUT,
-    ).get_data_frames()[0])
+    return _retry(
+        lambda: leaguedashteamstats.LeagueDashTeamStats(
+            measure_type_detailed_defense=measure_type,
+            per_mode_detailed="Per100Possessions",
+            season=season,
+            season_type_all_star="Regular Season",
+            headers=NBA_HEADERS,
+            timeout=API_TIMEOUT,
+        ).get_data_frames()[0],
+        label=f"LeagueDashTeamStats({measure_type})",
+    )
 
 
 def fetch_hustle(season: str) -> pd.DataFrame:
-    return _retry(lambda: leaguehustlestatsteam.LeagueHustleStatsTeam(
-        per_mode_time="PerGame",
-        season=season,
-        season_type_all_star="Regular Season",
-        timeout=API_TIMEOUT,
-    ).get_data_frames()[0])
+    return _retry(
+        lambda: leaguehustlestatsteam.LeagueHustleStatsTeam(
+            per_mode_time="PerGame",
+            season=season,
+            season_type_all_star="Regular Season",
+            headers=NBA_HEADERS,
+            timeout=API_TIMEOUT,
+        ).get_data_frames()[0],
+        label="LeagueHustleStatsTeam",
+    )
 
 
 def fetch_opp_shot_profile(season: str) -> pd.DataFrame:
-    return _retry(lambda: leaguedashoppptshot.LeagueDashOppPtShot(
-        league_id="00",
-        per_mode_simple="PerGame",
-        season=season,
-        season_type_all_star="Regular Season",
-        timeout=API_TIMEOUT,
-    ).get_data_frames()[0])
+    return _retry(
+        lambda: leaguedashoppptshot.LeagueDashOppPtShot(
+            league_id="00",
+            per_mode_simple="PerGame",
+            season=season,
+            season_type_all_star="Regular Season",
+            headers=NBA_HEADERS,
+            timeout=API_TIMEOUT,
+        ).get_data_frames()[0],
+        label="LeagueDashOppPtShot",
+    )
 
 
 def compile_raw_data(season: str, log_fn=None) -> dict[str, pd.DataFrame]:
@@ -410,6 +461,8 @@ def train_kmeans(X: np.ndarray, k: int) -> tuple[KMeans, np.ndarray]:
 def run_pipeline(
     season: str = "2025-26",
     *,
+    artifact_key: str = "full",
+    window_params: dict | None = None,
     do_residualize: bool = True,
     pca_variance_target: float = 0.85,
     drop_pc1_threshold: float = 0.6,
@@ -422,6 +475,9 @@ def run_pipeline(
 
     Parameters
     ----------
+    artifact_key        : artifact key for output files (e.g. "full", "last12")
+    window_params       : optional dict with WINDOW_TYPE, WINDOW_VALUE; if set and
+                          not supported by NBA API, raises UnsupportedFilterError
     do_residualize      : regress out DEF_RATING from every style feature
     pca_variance_target : cumulative variance to retain in PCA
     drop_pc1_threshold  : if |corr(PC1, DEF_RATING)| > this, exclude PC1
@@ -434,8 +490,17 @@ def run_pipeline(
             log_fn(msg)
         print(f"[pipeline] {msg}")
 
+    if window_params:
+        raise UnsupportedFilterError(
+            "Window filters (last N games, month, season segment) are not supported "
+            "by the NBA API endpoints used in this pipeline. Use artifact_key='full' "
+            "for full-season clustering."
+        )
+
     DATA_CACHE.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).isoformat()
+    window_type = "full"
+    window_value = ""
 
     # 1 -- Compile raw data ------------------------------------------------
     raw = compile_raw_data(season, log_fn=log_fn)
@@ -520,6 +585,9 @@ def run_pipeline(
         output[f"_PC{i + 1}"] = X_pca_full[:, i]
 
     output["SEASON"] = season
+    output["ARTIFACT_KEY"] = artifact_key
+    output["WINDOW_TYPE"] = window_type
+    output["WINDOW_VALUE"] = window_value
     output["K_USED"] = best_k
     output["CHOSEN_K"] = best_k
     output["PIPELINE_VERSION"] = PIPELINE_VERSION
@@ -534,14 +602,17 @@ def run_pipeline(
         abbr_map = pd.read_parquet(teams_path).set_index("id")["abbreviation"].to_dict()
         output["TEAM_ABBREVIATION"] = output["TEAM_ID"].map(abbr_map)
 
-    # 12 -- Save canonical Parquet (season-scoped) --------------------------
-    canon_path = DATA_CACHE / f"defense_clusters_{season}_full.parquet"
-    output.to_parquet(canon_path, index=False)
-    _log(f"  Saved -> {canon_path}")
+    # 12 -- Save Parquet (season + artifact_key) ----------------------------
+    out_path = DATA_CACHE / f"defense_clusters_{season}_{artifact_key}.parquet"
+    output.to_parquet(out_path, index=False)
+    _log(f"  Saved -> {out_path}")
 
-    # Also keep the legacy non-_full path so older loader code still works
-    legacy_path = DATA_CACHE / f"defense_clusters_{season}.parquet"
-    output.to_parquet(legacy_path, index=False)
+    # Legacy: when artifact_key is "full", also write canonical and non-_full paths
+    if artifact_key == "full":
+        canon_path = DATA_CACHE / f"defense_clusters_{season}_full.parquet"
+        output.to_parquet(canon_path, index=False)
+        legacy_path = DATA_CACHE / f"defense_clusters_{season}.parquet"
+        output.to_parquet(legacy_path, index=False)
 
     # 13 -- Diagnostics JSON sidecar ---------------------------------------
     diagnostics = {
@@ -552,6 +623,8 @@ def run_pipeline(
         "pca_variance_target": pca_variance_target,
         "pca_components_kept": int(n_keep),
         "pca_explained_variance": pca_obj.explained_variance_ratio_.tolist(),
+        "pca_components": pca_obj.components_.tolist(),
+        "pca_feature_names": features_after,
         "pc1_quality_corr": round(pc1_corr, 4),
         "dropped_pc1": should_drop,
         "drop_pc1_threshold": drop_pc1_threshold,
@@ -560,14 +633,19 @@ def run_pipeline(
         "features_before_pruning": features_before,
         "features_after_pruning": features_after,
         "dropped_features": dropped,
+        "artifact_key": artifact_key,
+        "window_type": window_type,
+        "window_value": window_value,
     }
-    diag_path = DATA_CACHE / f"defense_clusters_{season}_full_diagnostics.json"
+    diag_path = DATA_CACHE / f"defense_clusters_{season}_{artifact_key}_diagnostics.json"
     diag_path.write_text(json.dumps(diagnostics, indent=2))
     _log(f"  Diagnostics -> {diag_path}")
 
-    # Legacy diagnostics path
-    legacy_diag = DATA_CACHE / f"defense_clusters_{season}_diagnostics.json"
-    legacy_diag.write_text(json.dumps(diagnostics, indent=2))
+    if artifact_key == "full":
+        legacy_diag = DATA_CACHE / f"defense_clusters_{season}_diagnostics.json"
+        legacy_diag.write_text(json.dumps(diagnostics, indent=2))
+        legacy_full_diag = DATA_CACHE / f"defense_clusters_{season}_full_diagnostics.json"
+        legacy_full_diag.write_text(json.dumps(diagnostics, indent=2))
 
     # 14 -- Backward-compatible legacy files -------------------------------
     compat = output[["TEAM_ID", "CLUSTER"]].rename(columns={"CLUSTER": "cluster"})

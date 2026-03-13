@@ -1,0 +1,18 @@
+{
+  "timestamp": "2026-03-13T02:01:32.820790+00:00",
+  "options": {
+    "force": true,
+    "seasons_arg": 10,
+    "dry_run": false
+  },
+  "rows": [
+    {
+      "season": "2024-25",
+      "status": "built",
+      "chosen_k": 4,
+      "silhouette": 0.14268871828019858,
+      "updated_at": "2026-03-13T02:00:23.379690+00:00",
+      "path": "D:\\dev_2026\\clustercalculator\\app\\data_cache\\defense_clusters_2024-25_full.parquet"
+    }
+  ]
+}
