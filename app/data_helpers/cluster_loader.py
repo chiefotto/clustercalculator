@@ -35,6 +35,7 @@ _META = {
     "TEAM_ID", "TEAM_NAME", "TEAM_ABBREVIATION",
     "GP", "W", "L", "W_PCT",
     "CLUSTER", "PCA_1", "PCA_2", "SEASON",
+    "ARTIFACT_KEY", "WINDOW_TYPE", "WINDOW_VALUE",
     "K_USED", "CHOSEN_K",
     "DEF_RATING",
     "PIPELINE_VERSION", "UPDATED_AT",
@@ -44,18 +45,29 @@ _META = {
 _PC_PREFIX = "_PC"
 
 _SEASON_RE = re.compile(r"defense_clusters_(\d{4}-\d{2})")
+_ARTIFACT_KEY_RE = re.compile(r"defense_clusters_\d{4}-\d{2}_([^.]+)\.parquet")
 
 
 # ── Path helpers ──────────────────────────────────────────────────────────
 
 def canonical_path_for_season(season: str) -> Path:
-    """Return the canonical parquet path for *season*."""
+    """Return the canonical parquet path for *season* (full artifact)."""
     return DATA_CACHE / f"defense_clusters_{season}_full.parquet"
 
 
 def canonical_diagnostics_path_for_season(season: str) -> Path:
-    """Return the canonical diagnostics JSON path for *season*."""
+    """Return the canonical diagnostics JSON path for *season* (full artifact)."""
     return DATA_CACHE / f"defense_clusters_{season}_full_diagnostics.json"
+
+
+def parquet_path(season: str, artifact_key: str) -> Path:
+    """Return the parquet path for *season* and *artifact_key*."""
+    return DATA_CACHE / f"defense_clusters_{season}_{artifact_key}.parquet"
+
+
+def diagnostics_path(season: str, artifact_key: str) -> Path:
+    """Return the diagnostics JSON path for *season* and *artifact_key*."""
+    return DATA_CACHE / f"defense_clusters_{season}_{artifact_key}_diagnostics.json"
 
 
 def parse_season_from_filename(filename: str) -> str | None:
@@ -112,20 +124,63 @@ def available_seasons() -> list[str]:
     return sorted(seen)
 
 
+# ── Artifact discovery ───────────────────────────────────────────────────
+
+def list_available_artifacts(season: str) -> list[str]:
+    """
+    List artifact keys for *season* (e.g. ["full", "last12", "asof_2025-01-15"]).
+    Scans data_cache for defense_clusters_{season}_*.parquet and extracts the key.
+    Legacy defense_clusters_{season}.parquet is treated as "full".
+    """
+    keys: set[str] = set()
+    prefix = f"defense_clusters_{season}"
+    for p in DATA_CACHE.glob(f"{prefix}*.parquet"):
+        if p.name == f"{prefix}.parquet":
+            keys.add("full")
+        else:
+            m = _ARTIFACT_KEY_RE.match(p.name)
+            if m:
+                keys.add(m.group(1))
+    return sorted(keys)
+
+
+def resolve_latest_artifact(season: str) -> str:
+    """
+    Return the best artifact key for *season*: prefer rolling/asof > full.
+    If none exist, returns "full" (caller should check existence).
+    """
+    available = list_available_artifacts(season)
+    if not available:
+        return "full"
+    # Prefer keys that look like asof_* or last*
+    for k in available:
+        if k.startswith("asof_") or k.startswith("last"):
+            return k
+    return available[0] if available else "full"
+
+
 # ── Core loader ───────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
-def load_defense_clusters(season: str = "2025-26") -> pd.DataFrame:
+def load_defense_clusters(
+    season: str = "2025-26",
+    artifact_key: str = "full",
+) -> pd.DataFrame:
     """
-    Load the defense-clusters parquet for *season*.
+    Load the defense-clusters parquet for *season* and *artifact_key*.
 
-    Resolution order: canonical ``_full`` path first, then legacy.
+    Resolution for artifact_key="full": tries canonical _full path, then legacy.
     Guardrails: requires TEAM_ID, TEAM_NAME, CLUSTER.
     """
-    path = _resolve_parquet_path(season)
+    if artifact_key == "full":
+        path = _resolve_parquet_path(season)
+    else:
+        path = parquet_path(season, artifact_key)
+        if not path.exists():
+            path = None
     if path is None:
         st.error(
-            f"No cluster file for season **{season}**.  "
+            f"No cluster file for season **{season}** artifact **{artifact_key}**.  "
             "Use **Update clusters now** to generate it."
         )
         return pd.DataFrame()
@@ -144,6 +199,34 @@ def load_defense_clusters(season: str = "2025-26") -> pd.DataFrame:
 def invalidate_cache():
     """Clear the cached cluster load so the next call reads fresh data."""
     load_defense_clusters.clear()
+
+
+def load_diagnostics(season: str, artifact_key: str = "full") -> dict | None:
+    """Load the sidecar diagnostics JSON for *season* and *artifact_key*."""
+    if artifact_key == "full":
+        path = _resolve_diagnostics_path(season)
+    else:
+        path = diagnostics_path(season, artifact_key)
+        if not path.exists():
+            path = None
+    if path is not None:
+        return json.loads(path.read_text())
+    return None
+
+
+def last_updated(season: str, artifact_key: str = "full") -> str | None:
+    """Return the ISO timestamp of the last pipeline run for this artifact, or None."""
+    diag = load_diagnostics(season, artifact_key)
+    if diag:
+        return diag.get("updated_at")
+    if artifact_key == "full":
+        path = _resolve_parquet_path(season)
+    else:
+        path = parquet_path(season, artifact_key)
+    if path is not None and path.exists():
+        ts = datetime.fromtimestamp(path.stat().st_mtime)
+        return ts.isoformat()
+    return None
 
 
 # ── Get-or-build ─────────────────────────────────────────────────────────
@@ -188,6 +271,92 @@ def get_meta_df(df: pd.DataFrame) -> pd.DataFrame:
     return df[cols].copy()
 
 
+# ── Team-season index (for similar-teams search) ───────────────────────────
+
+@st.cache_data(ttl=3600)
+def build_team_season_index(
+    include_latest_current: bool = False,
+    _seasons: tuple[str, ...] | None = None,
+) -> tuple[pd.DataFrame, list[str], dict]:
+    """
+    Build a unified (season, artifact_key, team, cluster, feature_vector) index
+    from full-season artifacts for the last 10 seasons.
+
+    Returns (index_df, feature_columns_used, log_info).
+    Uses global intersection of features across all loaded artifacts.
+    NaN in feature vectors is imputed as 0 (league average).
+    """
+    seasons = list(_seasons) if _seasons else sorted(available_seasons())
+    if not seasons:
+        return pd.DataFrame(), [], {"message": "No seasons available"}
+
+    # Prefer full for all; for current season optionally add latest
+    current = seasons[-1] if seasons else None
+    rows: list[dict] = []
+    all_feature_sets: list[set[str]] = []
+
+    for season in seasons:
+        keys = ["full"]
+        if include_latest_current and season == current:
+            latest = resolve_latest_artifact(season)
+            if latest != "full" and parquet_path(season, latest).exists():
+                keys.append(latest)
+        for artifact_key in keys:
+            path = parquet_path(season, artifact_key) if artifact_key != "full" else _resolve_parquet_path(season)
+            if path is None or not path.exists():
+                continue
+            df = pd.read_parquet(path)
+            if df.empty or "CLUSTER" not in df.columns:
+                continue
+            feat = get_feature_columns(df)
+            all_feature_sets.append(set(feat))
+            league_mu = df[feat].mean()
+            league_sd = df[feat].std().replace(0, np.nan)
+            cluster_labels = compute_cluster_labels(df, league_mu, league_sd)
+            for _, row in df.iterrows():
+                cid = int(row["CLUSTER"])
+                z_vec = (row[feat] - league_mu) / league_sd
+                z_vec = z_vec.fillna(0)
+                rows.append({
+                    "season": season,
+                    "artifact_key": artifact_key,
+                    "team_id": row["TEAM_ID"],
+                    "team_name": row["TEAM_NAME"],
+                    "cluster_id": cid,
+                    "cluster_label": cluster_labels.get(cid, ""),
+                    "feature_vector": z_vec.values.tolist(),
+                    "feature_names": feat,
+                })
+    if not rows:
+        return pd.DataFrame(), [], {"message": "No rows loaded"}
+
+    # Global intersection of features
+    common = set(all_feature_sets[0])
+    for s in all_feature_sets[1:]:
+        common &= s
+    common = sorted(common)
+
+    # Rebuild vectors using only common features (and align order)
+    index_rows = []
+    for r in rows:
+        names = r["feature_names"]
+        vec = r["feature_vector"]
+        z_map = dict(zip(names, vec))
+        aligned = [float(z_map.get(f, 0)) for f in common]
+        index_rows.append({
+            "season": r["season"],
+            "artifact_key": r["artifact_key"],
+            "team_id": r["team_id"],
+            "team_name": r["team_name"],
+            "cluster_id": r["cluster_id"],
+            "cluster_label": r.get("cluster_label", ""),
+            "feature_vector": aligned,
+        })
+    index_df = pd.DataFrame(index_rows)
+    log_info = {"features_used": len(common), "seasons": len(seasons), "rows": len(index_df)}
+    return index_df, common, log_info
+
+
 # ── Cached aggregates ────────────────────────────────────────────────────
 
 @st.cache_data
@@ -206,28 +375,6 @@ def compute_league_means(df: pd.DataFrame) -> pd.Series:
 def compute_league_stds(df: pd.DataFrame) -> pd.Series:
     feat = get_feature_columns(df)
     return df[feat].std()
-
-
-# ── Diagnostics ──────────────────────────────────────────────────────────
-
-def load_diagnostics(season: str) -> dict | None:
-    """Load the sidecar diagnostics JSON produced by the pipeline."""
-    path = _resolve_diagnostics_path(season)
-    if path is not None:
-        return json.loads(path.read_text())
-    return None
-
-
-def last_updated(season: str) -> str | None:
-    """Return the ISO timestamp of the last pipeline run, or None."""
-    diag = load_diagnostics(season)
-    if diag:
-        return diag.get("updated_at")
-    path = _resolve_parquet_path(season)
-    if path is not None:
-        ts = datetime.fromtimestamp(path.stat().st_mtime)
-        return ts.isoformat()
-    return None
 
 
 # ── Display helpers (Units toggle) ────────────────────────────────────────

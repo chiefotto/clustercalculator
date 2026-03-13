@@ -2,9 +2,8 @@
 Defense Clusters -- Visualizations
 ==================================
 Dedicated Streamlit page for exploring and interpreting team defensive
-clusters.  Supports on-demand recomputation via an "Update clusters now"
-button that mirrors the player-logs update pattern (cached load + action
-+ save + rerun).
+clusters.  Data is prefilled by running scripts/backfill_defense_clusters.py
+from the repo root; this page only loads from disk.
 """
 
 import numpy as np
@@ -24,13 +23,13 @@ from data_helpers.cluster_loader import (
     compute_league_stds,
     format_feature_value,
     get_feature_columns,
-    get_or_build_defense_clusters,
     interpret_pc_axis,
-    invalidate_cache,
     last_updated,
+    list_available_artifacts,
     load_defense_clusters,
     load_diagnostics,
     percentile_to_band,
+    resolve_latest_artifact,
     z_to_percentile,
 )
 
@@ -40,7 +39,7 @@ CLUSTER_PALETTE = px.colors.qualitative.Set2
 
 st.title("Defense Clusters")
 
-# ── Sidebar: season selector + update controls ───────────────────────────
+# ── Sidebar: season + artifact (data prefilled by backfill script) ────────
 
 seasons = available_seasons()
 
@@ -52,93 +51,57 @@ with st.sidebar:
             "Season", seasons, index=len(seasons) - 1,
         )
     else:
-        selected_season = None
+        selected_season = "2025-26"
 
     _current_year = 2025
     _all_seasons = [f"{y}-{str(y+1)[-2:]}" for y in range(_current_year, _current_year - 10, -1)]
-    _missing = [s for s in _all_seasons if s not in seasons]
 
-    if _missing:
-        new_season = st.selectbox(
-            "Or generate a new season",
-            options=[""] + _missing,
-            format_func=lambda s: "-- select --" if s == "" else s,
-            help="Pick a season to fetch and cluster from the NBA API.",
-        )
-    else:
-        new_season = ""
+    # -- Artifact mode: Full (historical) vs Latest (current season only) --
+    artifact_keys = list_available_artifacts(selected_season)
+    if not artifact_keys:
+        artifact_keys = ["full"]
+    _latest_key = resolve_latest_artifact(selected_season)
+    if _latest_key != "full" and _latest_key not in artifact_keys and selected_season == _all_seasons[0]:
+        artifact_keys = ["full", _latest_key]
+    artifact_options = artifact_keys
+    artifact_labels = {
+        "full": "Full (historical)",
+        **{k: f"Latest ({k})" for k in artifact_options if k != "full"},
+    }
+    selected_artifact = st.selectbox(
+        "Artifact",
+        artifact_options,
+        format_func=lambda k: artifact_labels.get(k, k),
+        help="Full = full-season artifact; Latest = rolling/asof for current season.",
+    )
 
-    if new_season:
-        selected_season = new_season
-    elif selected_season is None:
-        selected_season = "2025-26"
-
-    # -- Last-updated display --
-    ts = last_updated(selected_season)
+    # -- Last-updated + pipeline version --
+    ts = last_updated(selected_season, selected_artifact)
     if ts:
         st.caption(f"Last updated: {ts[:19].replace('T', ' ')} UTC")
     else:
         st.caption("Last updated: never")
+    diag_sidebar = load_diagnostics(selected_season, selected_artifact)
+    if diag_sidebar:
+        st.caption(f"Pipeline: {diag_sidebar.get('pipeline_version', '?')}")
 
-    # -- Update / Refresh button --
-    update_clicked = st.button(
-        f"Update clusters ({selected_season})",
-        type="primary",
-        help=(
-            f"Re-fetch NBA API data for **{selected_season}**, re-cluster, "
-            "and save a new season-scoped Parquet. Other seasons are untouched."
-        ),
-    )
+# ── Load data from disk ───────────────────────────────────────────────────
 
-# ── Handle update action (before loading data) ──────────────────────────
-
-if update_clicked:
-    with st.status(
-        f"Recomputing clusters for {selected_season} ...", expanded=True,
-    ) as status:
-        progress_container = st.empty()
-
-        def _log(msg):
-            progress_container.write(msg)
-
-        try:
-            get_or_build_defense_clusters(
-                selected_season, force_refresh=True, log_fn=_log,
-            )
-            status.update(label="Clusters updated!", state="complete")
-            st.toast(f"Pipeline finished for {selected_season}.")
-            st.rerun()
-
-        except Exception as exc:
-            status.update(label="Pipeline failed", state="error")
-            msg = str(exc)
-            if "empty response" in msg.lower() or "not available" in msg.lower():
-                st.warning(
-                    f"No NBA data available for **{selected_season}**.  "
-                    "The season may not have started yet or the NBA API "
-                    "does not serve stats for it."
-                )
-            else:
-                st.error(f"Pipeline error: {exc}")
-            st.stop()
-
-# ── Load cached data ─────────────────────────────────────────────────────
-
-if not seasons and not new_season:
+if not seasons:
     st.warning(
-        "No cluster files found. Enter a season above and click "
-        "**Update clusters** to generate the initial clustering."
+        "No cluster data found. Prefill by running from the repo root:\n\n"
+        "`python scripts/backfill_defense_clusters.py`"
     )
     st.stop()
 
-df = load_defense_clusters(selected_season)
+df = load_defense_clusters(selected_season, selected_artifact)
 if df.empty:
     st.stop()
 
 feature_cols = get_feature_columns(df)
 clusters = sorted(df["CLUSTER"].unique())
 teams = sorted(df["TEAM_NAME"].unique())
-diag = load_diagnostics(selected_season)
+diag = load_diagnostics(selected_season, selected_artifact)
 
 league_means = compute_league_means(df)
 league_stds = compute_league_stds(df)
